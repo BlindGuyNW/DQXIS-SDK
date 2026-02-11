@@ -278,6 +278,8 @@ bool TryLoadINIOptions(const WCHAR* IniFilePath)
   Options.HideMinimap = INI_GetBool(IniPath, L"FirstPerson", L"HideMinimap", Options.HideMinimap); 
   Options.FirstPersonMovableHeight = INI_GetFloat(IniPath, L"FirstPerson", L"MovableCameraHeight", Options.FirstPersonMovableHeight);
 
+  Options.AccessibilityLogger = INI_GetBool(IniPath, L"Accessibility", L"LogUIEvents", Options.AccessibilityLogger);
+
   // Check old INI names
   if (INI_GetBool(IniPath, L"Patches", L"BindFromIniOnly", false))
     Options.BindFromInputIniOnly = true;
@@ -402,6 +404,9 @@ void InitPlugin()
   Init_FirstPerson();
 
   Init_DQXIHook();
+
+  if (Options.AccessibilityLogger)
+    Init_AccessibilityLogger();
 
   MH_EnableHook(MH_ALL_HOOKS);
 }

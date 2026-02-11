@@ -989,6 +989,9 @@
     <ClCompile Include="DQXIHook.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="AccessibilityLogger.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="CustomActions.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

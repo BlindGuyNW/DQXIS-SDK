@@ -507,6 +507,7 @@
     <ClInclude Include="pch.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="AccessibilityLogger.cpp" />
     <ClCompile Include="CustomActions.cpp" />
     <ClCompile Include="DefaultInputIni.cpp">
       <PrecompiledHeader>NotUsing</PrecompiledHeader>

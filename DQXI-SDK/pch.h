@@ -18,6 +18,7 @@ struct IniSettings {
   bool AllowDebugPackages = true;
   bool FixCommonMisconfigs = true;
   bool BindFromInputIniOnly = false;
+  bool AccessibilityLogger = false;
 };
 
 #define MH_Hook(addr, hook, orig) MH_CreateHook((LPVOID)(mBaseAddress + addr), hook, (LPVOID*)orig)
@@ -123,6 +124,9 @@ void Init_CustomActions();
 typedef UObject* (*StaticConstructObject_InternalFn)(UClass* Class, UObject* InOuter, FName Name, void* SetFlags, void* InternalSetFlags, UObject* Template, bool bCopyTransientsFromClassDefaults, struct FObjectInstancingGraph* InstanceGraph, bool bAssumeTemplateIsArchetype);
 extern StaticConstructObject_InternalFn StaticConstructObject_Internal;
 void Init_DQXIHook();
+
+// AccessibilityLogger.cpp
+void Init_AccessibilityLogger();
 
 // FirstPerson.cpp
 extern FName CamStyle_FirstPersonView;
