@@ -250,6 +250,10 @@ static const wchar_t* TryCallGetDisplayString(uintptr_t textDataPtr)
   return nullptr;
 }
 
+// POD struct for reading TArray return values from ProcessEvent
+// Cannot use TArray<T> in __try blocks because it has a destructor
+struct RawTArray { uintptr_t Data; int32_t Count; int32_t Max; };
+
 // Forward declaration (defined later, after ProcessEvent hook section)
 static const char* TryReadFName(uintptr_t baseAddr, uintptr_t offset);
 
@@ -483,6 +487,141 @@ static int TryCallGetValue_SEH(UObject* widget, UFunction* func)
   return -1;
 }
 
+// --- Save data functions via ProcessEvent ---
+// Used to read save slot info (player name, level, location, play time)
+// for the save/load/delete screens.
+
+static UFunction* g_GetAccessorSaveDataFunc = nullptr;
+static bool g_GetAccessorSaveDataSearched = false;
+
+static void EnsureGetAccessorSaveDataFunc()
+{
+  if (g_GetAccessorSaveDataSearched)
+    return;
+  g_GetAccessorSaveDataSearched = true;
+
+  g_GetAccessorSaveDataFunc = UObject::FindObject<UFunction>("Function JackGame.JackUMGWidgetBase.GetAccessorSaveData");
+  if (g_GetAccessorSaveDataFunc)
+    LogEvent("[SAVEDATA] ", "Found GetAccessorSaveData UFunction");
+  else
+    LogEvent("[SAVEDATA] ", "GetAccessorSaveData UFunction NOT found");
+}
+
+static UFunction* g_GetSaveDataListFunc = nullptr;
+static bool g_GetSaveDataListSearched = false;
+
+static void EnsureGetSaveDataListFunc()
+{
+  if (g_GetSaveDataListSearched)
+    return;
+  g_GetSaveDataListSearched = true;
+
+  g_GetSaveDataListFunc = UObject::FindObject<UFunction>("Function JackGame.JackUMGAccessorSaveData.GetSaveDataListFromCached");
+  if (g_GetSaveDataListFunc)
+    LogEvent("[SAVEDATA] ", "Found GetSaveDataListFromCached UFunction");
+  else
+    LogEvent("[SAVEDATA] ", "GetSaveDataListFromCached UFunction NOT found");
+}
+
+static UFunction* g_GetSaveDataContainerFunc = nullptr;
+static bool g_GetSaveDataContainerSearched = false;
+static UObject* g_SaveDataContainerCDO = nullptr;
+
+static void EnsureGetSaveDataContainerFunc()
+{
+  if (g_GetSaveDataContainerSearched)
+    return;
+  g_GetSaveDataContainerSearched = true;
+
+  g_GetSaveDataContainerFunc = UObject::FindObject<UFunction>("Function JackGame.JackUMGSaveDataContainer.GetSaveDataContainer");
+  if (g_GetSaveDataContainerFunc)
+    LogEvent("[SAVEDATA] ", "Found GetSaveDataContainer UFunction");
+  else
+    LogEvent("[SAVEDATA] ", "GetSaveDataContainer UFunction NOT found");
+
+  // Get the Class Default Object (CDO) for calling the static function
+  auto saveDataContainerClass = UObject::FindClass("Class JackGame.JackUMGSaveDataContainer");
+  if (saveDataContainerClass)
+  {
+    // UClass::ClassDefaultObject is at offset 0x0108
+    g_SaveDataContainerCDO = *reinterpret_cast<UObject**>(reinterpret_cast<uintptr_t>(saveDataContainerClass) + 0x0108);
+    if (g_SaveDataContainerCDO)
+      LogEvent("[SAVEDATA] ", "Found SaveDataContainer CDO");
+    else
+    {
+      LogEvent("[SAVEDATA] ", "SaveDataContainer CDO is null, will retry");
+      g_GetSaveDataContainerSearched = false; // retry next time
+    }
+  }
+  else
+  {
+    LogEvent("[SAVEDATA] ", "SaveDataContainer class NOT found");
+    g_GetSaveDataContainerSearched = false; // retry next time
+  }
+}
+
+// --- SEH-safe ProcessEvent wrappers for save data ---
+
+static UObject* TryCallGetAccessorSaveData_SEH(UObject* windowObj, UFunction* func)
+{
+  if (!g_ProcessEvent_Orig)
+    return nullptr;
+
+  struct { UObject* ReturnValue; } params;
+  params.ReturnValue = nullptr;
+
+  __try
+  {
+    g_ProcessEvent_Orig(windowObj, func, &params);
+    return params.ReturnValue;
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {}
+  return nullptr;
+}
+
+static RawTArray TryCallGetSaveDataList_SEH(UObject* accessor, UFunction* func)
+{
+  RawTArray result = { 0, 0, 0 };
+  if (!g_ProcessEvent_Orig)
+    return result;
+
+  // TArray<UJackUMGItemData*> is { Data* (8), Count (4), Max (4) } = 16 bytes
+  char params[16];
+  memset(params, 0, sizeof(params));
+
+  __try
+  {
+    g_ProcessEvent_Orig(accessor, func, params);
+    memcpy(&result, params, sizeof(result));
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER)
+  {
+    result.Data = 0;
+    result.Count = 0;
+    result.Max = 0;
+  }
+  return result;
+}
+
+static UObject* TryCallGetSaveDataContainer_SEH(UObject* cdo, UFunction* func, UObject* itemData)
+{
+  if (!g_ProcessEvent_Orig)
+    return nullptr;
+
+  // Params: { UJackUMGItemData* ItemData; UJackUMGSaveDataContainer* ReturnValue; }
+  struct { UObject* ItemData; UObject* ReturnValue; } params;
+  params.ItemData = itemData;
+  params.ReturnValue = nullptr;
+
+  __try
+  {
+    g_ProcessEvent_Orig(cdo, func, &params);
+    return params.ReturnValue;
+  }
+  __except (EXCEPTION_EXECUTE_HANDLER) {}
+  return nullptr;
+}
+
 // SEH-safe helper: speak ItemID/TextID fallback when FText read fails
 static void SpeakItemFallbackName(UObject* selectedItemPtr)
 {
@@ -645,6 +784,198 @@ static void SpeakItemFallbackName(UObject* selectedItemPtr)
   }
 }
 
+// Try to read and speak save slot data for the selected item.
+// Returns true if save data was successfully spoken, false to fall through.
+static bool TrySpeakSaveSlotData(UObject* windowObj, UObject* selectedItemPtr)
+{
+  // Check that the selected item's class contains "Menu_Parts_014" (save slot widget)
+  auto itemAddr = reinterpret_cast<uintptr_t>(selectedItemPtr);
+  auto itemClassPtr = TryReadPtr(itemAddr + offsetof(UObject, Class));
+  if (!itemClassPtr)
+    return false;
+
+  const char* itemClassName = TryReadFName(itemClassPtr, 0x18);
+  if (!itemClassName || !strstr(itemClassName, "Menu_Parts_014"))
+    return false;
+
+  // Check that the selected item's ItemID starts with "cmd" (save slot items)
+  const char* widgetItemId = TryReadFName(itemAddr, 0x0380);
+  if (!widgetItemId || strncmp(widgetItemId, "cmd", 3) != 0)
+    return false;
+
+  char logBuf[256];
+  sprintf_s(logBuf, "[SAVEDATA] Save slot detected: class=%s item=%s", itemClassName, widgetItemId);
+  LogEvent("", logBuf);
+
+  // Step 1: Get the save data accessor from the window
+  EnsureGetAccessorSaveDataFunc();
+  if (!g_GetAccessorSaveDataFunc || !g_ProcessEvent_Orig)
+    return false;
+
+  auto accessor = TryCallGetAccessorSaveData_SEH(windowObj, g_GetAccessorSaveDataFunc);
+  if (!accessor)
+  {
+    LogEvent("[SAVEDATA] ", "GetAccessorSaveData returned null");
+    return false;
+  }
+  LogEvent("[SAVEDATA] ", "Got save data accessor");
+
+  // Step 2: Get the save data list from the accessor
+  EnsureGetSaveDataListFunc();
+  if (!g_GetSaveDataListFunc)
+    return false;
+
+  RawTArray saveList = TryCallGetSaveDataList_SEH(accessor, g_GetSaveDataListFunc);
+  if (!saveList.Data || saveList.Count <= 0)
+  {
+    sprintf_s(logBuf, "[SAVEDATA] GetSaveDataListFromCached returned empty (count=%d)", saveList.Count);
+    LogEvent("", logBuf);
+    return false;
+  }
+
+  // Cap iteration for safety
+  int count = saveList.Count;
+  if (count > 32) count = 32;
+  sprintf_s(logBuf, "[SAVEDATA] Save data list has %d items", count);
+  LogEvent("", logBuf);
+
+  // Step 3: Find the matching ItemData by comparing FName ComparisonIndex
+  // Widget ItemID is at UJackUMGItemBase+0x0380 (FName)
+  // ItemData ItemID is at UJackUMGItemData+0x0040 (FName)
+  int32_t widgetCompIdx = TryReadInt32(itemAddr + 0x0380); // FName.ComparisonIndex
+  if (widgetCompIdx <= 0)
+  {
+    LogEvent("[SAVEDATA] ", "Widget ItemID ComparisonIndex invalid");
+    return false;
+  }
+
+  UObject* matchedItemData = nullptr;
+  auto dataArray = reinterpret_cast<UObject**>(saveList.Data);
+  for (int i = 0; i < count; i++)
+  {
+    uintptr_t itemDataPtr = TryReadPtr(reinterpret_cast<uintptr_t>(&dataArray[i]));
+    if (!itemDataPtr)
+      continue;
+
+    int32_t dataCompIdx = TryReadInt32(itemDataPtr + 0x0040); // FName.ComparisonIndex
+    if (dataCompIdx == widgetCompIdx)
+    {
+      matchedItemData = reinterpret_cast<UObject*>(itemDataPtr);
+      sprintf_s(logBuf, "[SAVEDATA] Matched ItemData at index %d (CompIdx=%d)", i, dataCompIdx);
+      LogEvent("", logBuf);
+      break;
+    }
+  }
+
+  if (!matchedItemData)
+  {
+    LogEvent("[SAVEDATA] ", "No matching ItemData found in save list");
+    return false;
+  }
+
+  // Step 4: Get the save data container
+  EnsureGetSaveDataContainerFunc();
+  if (!g_GetSaveDataContainerFunc || !g_SaveDataContainerCDO)
+    return false;
+
+  auto container = TryCallGetSaveDataContainer_SEH(g_SaveDataContainerCDO, g_GetSaveDataContainerFunc, matchedItemData);
+  if (!container)
+  {
+    LogEvent("[SAVEDATA] ", "GetSaveDataContainer returned null");
+    return false;
+  }
+  LogEvent("[SAVEDATA] ", "Got save data container");
+
+  // Step 5: Read fields from the container
+  auto containerAddr = reinterpret_cast<uintptr_t>(container);
+
+  // bIsValid at 0x0038
+  uint8_t isValid = TryReadByte(containerAddr + 0x0038);
+
+  // SlotIndex at 0x003C
+  int32_t slotIndex = TryReadInt32(containerAddr + 0x003C);
+  int slotNumber = (slotIndex >= 0) ? slotIndex + 1 : 0;
+
+  if (isValid == 0)
+  {
+    // Empty slot
+    wchar_t speechBuf[128];
+    if (slotNumber > 0)
+      swprintf_s(speechBuf, L"Slot %d: Empty", slotNumber);
+    else
+      swprintf_s(speechBuf, L"Empty slot");
+
+    std::wstring text(speechBuf);
+    if (text != g_LastSpoken)
+    {
+      g_LastSpoken = text;
+      Speak(speechBuf);
+      LogEventW("[SPEAK-SAVE] ", speechBuf);
+    }
+    return true;
+  }
+
+  // PlayerName at 0x0048 (FString)
+  const wchar_t* playerName = TryReadFStringAt(containerAddr, 0x0048);
+
+  // PlayerLevel at 0x0058
+  int32_t playerLevel = TryReadInt32(containerAddr + 0x0058);
+
+  // FukkatuLocation at 0x0060 (FText, 0x18 bytes)
+  const wchar_t* location = TryReadFText(reinterpret_cast<void*>(containerAddr + 0x0060));
+
+  // PlayTime at 0x0080 (FString)
+  const wchar_t* playTime = TryReadFStringAt(containerAddr, 0x0080);
+
+  // bIs2DMode at 0x00BD
+  uint8_t is2DMode = TryReadByte(containerAddr + 0x00BD);
+
+  // bIsNewGamePlus at 0x00C9
+  uint8_t isNewGamePlus = TryReadByte(containerAddr + 0x00C9);
+
+  // Step 6: Build speech string
+  wchar_t speechBuf[512];
+  int pos = 0;
+
+  if (slotNumber > 0)
+    pos += swprintf_s(speechBuf + pos, 512 - pos, L"Slot %d: ", slotNumber);
+
+  if (playerName)
+    pos += swprintf_s(speechBuf + pos, 512 - pos, L"%s", playerName);
+  else
+    pos += swprintf_s(speechBuf + pos, 512 - pos, L"Unknown");
+
+  if (playerLevel >= 0)
+    pos += swprintf_s(speechBuf + pos, 512 - pos, L", Level %d", playerLevel);
+
+  if (location)
+    pos += swprintf_s(speechBuf + pos, 512 - pos, L", %s", location);
+
+  if (playTime)
+    pos += swprintf_s(speechBuf + pos, 512 - pos, L", %s", playTime);
+
+  if (is2DMode == 1)
+    pos += swprintf_s(speechBuf + pos, 512 - pos, L", 2D Mode");
+
+  if (isNewGamePlus == 1)
+    pos += swprintf_s(speechBuf + pos, 512 - pos, L", New Game Plus");
+
+  // Step 7: Deduplicate and speak
+  std::wstring text(speechBuf);
+  if (text != g_LastSpoken && !text.empty())
+  {
+    g_LastSpoken = text;
+    Speak(speechBuf);
+    LogEventW("[SPEAK-SAVE] ", speechBuf);
+  }
+  else
+  {
+    LogEventW("[SKIP-DUP-SAVE] ", speechBuf);
+  }
+
+  return true;
+}
+
 // Try to read and speak the selected item from a window widget
 static void SpeakSelectedItem(UObject* windowObj)
 {
@@ -692,6 +1023,10 @@ static void SpeakSelectedItem(UObject* windowObj)
       return;
     }
   }
+
+  // Try save slot data before falling back to generic item reading
+  if (TrySpeakSaveSlotData(windowObj, selectedItemPtr))
+    return;
 
   SpeakItemFallbackName(selectedItemPtr);
 }
